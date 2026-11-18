@@ -1,0 +1,9 @@
+// 1. Wallets (~2M docs): Fast lookup & atomic conditional update by userId
+db.wallets.createIndex({ userId: 1 }, { unique: true });
+
+// 2. Ledger (~40M docs): Fast idempotency lookup per user
+db.ledger.createIndex({ userId: 1, idempotencyKey: 1 }, { unique: true });
+
+// 3. Ledger: Supports user history queries & stuck-PENDING reconciliation worker
+db.ledger.createIndex({ userId: 1, createdAt: -1 });
+db.ledger.createIndex({ status: 1, createdAt: 1 }, { partialFilterExpression: { status: 'PENDING' } });

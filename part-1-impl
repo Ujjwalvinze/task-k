@@ -1,0 +1,186 @@
+const { ObjectId } = require('mongodb');
+
+const MIN_WITHDRAWAL_PAISE = 100_00;    // ₹100.00 in paise
+const MAX_WITHDRAWAL_PAISE = 50000_00;  // ₹50,000.00 in paise
+
+// POST /api/wallet/withdraw
+// Headers: { 'Idempotency-Key': '<uuid-v4>' }
+// Body: { amount } (integer paise; userId comes strictly from auth middleware)
+async function withdraw(req, res) {
+  const userId = new ObjectId(req.user.id);
+  const { amount } = req.body;
+  const idempotencyKey = req.headers['idempotency-key'];
+
+  // 1. Strict Input & Idempotency Validation
+  if (!idempotencyKey || typeof idempotencyKey !== 'string' || idempotencyKey.length > 128) {
+    return res.status(400).json({ error: 'Valid Idempotency-Key header is required' });
+  }
+
+  if (!Number.isSafeInteger(amount) || amount < MIN_WITHDRAWAL_PAISE || amount > MAX_WITHDRAWAL_PAISE) {
+    return res.status(400).json({ error: 'Invalid withdrawal amount' });
+  }
+
+  // 2. Fast-path Idempotency Check (handles mobile app timeout retries safely)
+  const existingTx = await Ledger.findOne({ userId, idempotencyKey });
+  if (existingTx) {
+    if (existingTx.amount !== amount) {
+      return res.status(422).json({ error: 'Idempotency key reused with different parameters' });
+    }
+    return res.status(200).json({
+      ok: existingTx.status !== 'FAILED',
+      status: existingTx.status,
+      transactionId: existingTx._id,
+      balance: existingTx.balanceAfter
+    });
+  }
+
+  // 3. Verify User & Bank Details BEFORE touching money
+  const user = await Users.findOne(
+    { _id: userId },
+    { projection: { bankAccount: 1, kycVerified: 1, status: 1 } }
+  );
+  if (!user || user.status !== 'ACTIVE') {
+    return res.status(404).json({ error: 'Active user not found' });
+  }
+  if (!user.bankAccount || !user.kycVerified) {
+    return res.status(400).json({ error: 'Verified bank account required for withdrawal' });
+  }
+
+  // 4. Phase 1: Atomic Debit + PENDING Ledger Intent inside a Mongo Transaction
+  const ledgerId = new ObjectId();
+  const reference = `WD-${ledgerId.toString()}`;
+  const session = mongoClient.startSession();
+  let newBalance;
+
+  try {
+    await session.withTransaction(async () => {
+      const updatedWallet = await Wallets.findOneAndUpdate(
+        { userId, balance: { $gte: amount } },
+        {
+          $inc: { balance: -amount },
+          $set: { updatedAt: new Date() }
+        },
+        { session, returnDocument: 'after' }
+      );
+
+      if (!updatedWallet) {
+        const err = new Error('INSUFFICIENT_BALANCE');
+        err.code = 'INSUFFICIENT_BALANCE';
+        throw err;
+      }
+
+      newBalance = updatedWallet.balance;
+
+      await Ledger.insertOne(
+        {
+          _id: ledgerId,
+          userId,
+          idempotencyKey,
+          reference,
+          type: 'withdrawal',
+          status: 'PENDING', // State machine: PENDING -> PROCESSING / COMPLETED / FAILED
+          amount,
+          balanceAfter: newBalance,
+          createdAt: new Date(),
+          updatedAt: new Date()
+        },
+        { session }
+      );
+    });
+  } catch (err) {
+    await session.endSession();
+
+    if (err.code === 'INSUFFICIENT_BALANCE') {
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
+    // Race condition: parallel retry with the exact same Idempotency-Key hit unique index
+    if (err.code === 11000) {
+      const concurrentTx = await Ledger.findOne({ userId, idempotencyKey });
+      return res.status(200).json({
+        ok: concurrentTx.status !== 'FAILED',
+        status: concurrentTx.status,
+        transactionId: concurrentTx._id,
+        balance: concurrentTx.balanceAfter
+      });
+    }
+    throw err;
+  }
+  await session.endSession();
+
+  // 5. Phase 2: Call External Gateway Outside DB Transaction (never hold DB locks over HTTP)
+  try {
+    const gatewayRes = await gateway.createPayout({
+      account: user.bankAccount,
+      amount, // Pass integer paise (or convert cleanly at boundary)
+      reference // Unique & deterministic per ledgerId
+    });
+
+    await Ledger.updateOne(
+      { _id: ledgerId },
+      {
+        $set: {
+          status: 'PROCESSING', // Final 'COMPLETED' set on gateway webhook confirmation
+          gatewayPayoutId: gatewayRes.id,
+          updatedAt: new Date()
+        }
+      }
+    );
+
+    return res.status(200).json({
+      ok: true,
+      status: 'PROCESSING',
+      transactionId: ledgerId,
+      balance: newBalance
+    });
+  } catch (gatewayErr) {
+    // 6. Distinguish Definitive Rejection (4xx) vs Unknown Network State (Timeout / 5xx)
+    if (gatewayErr.isDeterministicFailure) {
+      // Gateway explicitly confirmed no payout was created -> safe to auto-refund atomically
+      const refundSession = mongoClient.startSession();
+      try {
+        await refundSession.withTransaction(async () => {
+          const refundedWallet = await Wallets.findOneAndUpdate(
+            { userId },
+            { $inc: { balance: amount }, $set: { updatedAt: new Date() } },
+            { session: refundSession, returnDocument: 'after' }
+          );
+
+          await Ledger.updateOne(
+            { _id: ledgerId, status: 'PENDING' },
+            {
+              $set: {
+                status: 'FAILED',
+                failureReason: gatewayErr.message,
+                updatedAt: new Date()
+              }
+            },
+            { session: refundSession }
+          );
+
+          newBalance = refundedWallet.balance;
+        });
+      } finally {
+        await refundSession.endSession();
+      }
+
+      return res.status(502).json({
+        ok: false,
+        status: 'FAILED',
+        error: 'Payout rejected by gateway; funds have been restored to your wallet.',
+        balance: newBalance
+      });
+    }
+
+    // Timeout or 5xx: We DO NOT refund immediately because the payout may have succeeded
+    // on the gateway side. Leave status as 'PENDING' and enqueue reconciliation job.
+    await reconciliationQueue.enqueue({ ledgerId, reference }, { delayMs: 30_000 });
+
+    return res.status(202).json({
+      ok: true,
+      status: 'PENDING',
+      transactionId: ledgerId,
+      balance: newBalance,
+      message: 'Withdrawal is being processed and will update shortly.'
+    });
+  }
+}

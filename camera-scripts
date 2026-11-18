@@ -1,0 +1,9 @@
+Part - 1
+
+* **#1 (Negative `amount` exploit) & #2 (Check-then-act race condition) — Direct, unbounded company money loss:** Both allow an attacker to drain Funngro's actual payment gateway pool. #1 is ranked slightly above #2 because a negative `amount` mints unlimited money out of thin air even for a user starting with a ₹0 balance, whereas #2 requires the user to already have a positive balance to multiply via parallel requests.
+* **#3 (40M-row `Ledger` scan + App retries without idempotency) — Accidental double-payouts + Full DB outage:** This loses real money on *legitimate* user traffic (because the 40M-doc scan forces the mobile app to time out and retry without an idempotency key, firing multiple real payouts) while simultaneously taking down the database for everyone.
+* **#4 (Trusting `req.body.userId` / IDOR) — Unauthorized triggers across user accounts:** It allows an attacker to trigger withdrawals on behalf of any user, though the payout still routes to the victim's own `user.bankAccount` rather than the attacker's bank (unless chained with a bank-update vulnerability).
+* **#5 (Missing `await` + Swallowed gateway error) & #6 (No DB transaction) — User fund loss & corrupted books:** Here, Funngro doesn't overpay out of its bank account, but users lose their wallet balances into a black hole when the gateway fails or a process crashes, destroying user trust and making the ledger impossible for finance to reconcile.
+* **#7 (`Date.now()` reference collisions) & #8 (Null crashes / 2M `Wallets` scan) — Edge-case failures & availability bugs:** These cause failed payouts under millisecond-level concurrency or return 500s on missing wallet/bank records, which are serious reliability bugs, but they don't allow someone to empty the company's bank account.
+
+Are you happy with this ordering for Part 1, or would you like to move on to **Part 2 (Reward Points Schema, Indexes & Aggregation Pipeline)**?
